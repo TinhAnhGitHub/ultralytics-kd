@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+import torch.nn.functional as F
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -62,6 +63,157 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+
+
+
+class KnowledgeDistillationKLDivLoss(nn.Module):
+    """Loss function for knowledge distillation using KL divergence.
+    
+    This loss measures the divergence between student predictions and teacher
+    predictions (soft labels) using KL divergence with temperature scaling.
+    
+    Args:
+        reduction (str): Specifies the reduction to apply to the output:
+            'none' | 'mean' | 'sum'. Default: 'mean'
+        loss_weight (float): Weight of the loss. Default: 1.0
+        T (float): Temperature for distillation. Higher temperature produces
+            softer probability distributions. Default: 10.0
+        detach_target (bool): Whether to detach soft labels from the
+            computation graph. Default: True
+    
+    Example:
+        >>> loss_fn = KnowledgeDistillationKLDivLoss(T=4.0, loss_weight=0.5)
+        >>> student_logits = torch.randn(32, 10)  # (batch_size, num_classes)
+        >>> teacher_logits = torch.randn(32, 10)
+        >>> loss = loss_fn(student_logits, teacher_logits)
+    """
+
+    def __init__(self, reduction='mean', loss_weight=1.0, T=10.0, detach_target=True):
+        super(KnowledgeDistillationKLDivLoss, self).__init__()
+        assert T >= 1, f"Temperature T must be >= 1, got {T}"
+        assert reduction in ['none', 'mean', 'sum'], \
+            f"reduction must be 'none', 'mean', or 'sum', got {reduction}"
+        
+        self.reduction = reduction
+        self.loss_weight = loss_weight
+        self.T = T
+        self.detach_target = detach_target
+    
+    def forward(self, pred, soft_label, weight=None):
+        """Forward pass to compute the KL divergence loss.
+        
+        Args:
+            pred (torch.Tensor): Predicted logits from student model.
+                Shape: (N, C) or (N, C, H, W) for segmentation
+            soft_label (torch.Tensor): Target logits from teacher model.
+                Must have the same shape as pred.
+            weight (torch.Tensor, optional): Element-wise weights.
+                Shape should be broadcastable to loss shape.
+        
+        Returns:
+            torch.Tensor: Computed KD loss (scalar if reduction != 'none')
+        """
+        
+        assert pred.size() == soft_label.size(), \
+            f"pred and soft_label must have the same shape, got {pred.size()} and {soft_label.size()}"
+        
+        target = F.softmax(soft_label / self.T, dim=1)
+        if self.detach_target:
+            target = target.detach()
+        
+        kd_loss = F.kl_div(
+            F.log_softmax(pred / self.T, dim=1),
+            target,
+            reduction='none'
+        )
+        kd_loss = kd_loss.sum(dim=1)
+        kd_loss = kd_loss.mean(dim=-1) * (self.T ** 2)
+        if weight is not None:
+            kd_loss = kd_loss * weight
+        
+        if self.reduction == 'mean':
+            kd_loss = kd_loss.mean()
+        elif self.reduction == 'sum':
+            kd_loss = kd_loss.sum()
+        return self.loss_weight * kd_loss
+
+def batch_iou(box1, box2):
+    """
+    Calculates IoU between two sets of boxes.
+    box1, box2: [N, 4] (x1, y1, x2, y2)
+    """
+    lt = torch.max(box1[:, :2], box2[:, :2])  # [N, 2]
+    rb = torch.min(box1[:, 2:], box2[:, 2:])  # [N, 2]
+
+    wh = (rb - lt).clamp(min=0)  # [N, 2]
+    inter = wh[:, 0] * wh[:, 1]  # [N]
+
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+
+    iou = inter / (area1 + area2 - inter + 1e-7)
+    return iou
+
+
+
+class FeatureDistillationLoss(nn.Module):
+    """
+    Standard feature-level knowledge distillation.
+    Projects student features to teacher channel dimensions and computes MSE loss.
+    
+    Args:
+        student_channels (List[int]): Channel dimensions of student features [C1, C2, C3]
+        teacher_channels (List[int]): Channel dimensions of teacher features [C1, C2, C3]
+        loss_weight (float): Weight for the distillation loss (default: 1.0)
+        loss_type (str): 'mse' | 'l1' | 'smooth_l1' (default: 'mse')
+    """
+    def __init__(self, student_channels, teacher_channels, loss_weight=1.0, loss_type='mse'):
+        super().__init__()
+        self.loss_weight = loss_weight
+        self.loss_type = loss_type.lower()
+        
+        self.align_layers = nn.ModuleList()
+        for s_ch, t_ch in zip(student_channels, teacher_channels):
+            if s_ch != t_ch:
+                layer = nn.Sequential(
+                    nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(t_ch)  
+                )
+                self.align_layers.append(layer)
+            else:
+                self.align_layers.append(nn.Identity())
+    
+    def forward(self, student_features, teacher_features):
+        """
+        Args:
+            student_features: List[Tensor] - [B, C_s, H, W] for each level
+            teacher_features: List[Tensor] - [B, C_t, H, W] for each level (same spatial dims)
+        
+        Returns:
+            Scalar distillation loss
+        """
+        assert len(student_features) == len(teacher_features), \
+            f"Mismatched feature levels: {len(student_features)} vs {len(teacher_features)}"
+        
+        total_loss = 0.0
+        for i, (s_feat, t_feat) in enumerate(zip(student_features, teacher_features)):
+            s_aligned = self.align_layers[i](s_feat)
+            
+            t_detached = t_feat.detach()
+            
+            if self.loss_type == 'mse':
+                loss = F.mse_loss(s_aligned, t_detached)
+            elif self.loss_type == 'l1':
+                loss = F.l1_loss(s_aligned, t_detached)
+            elif self.loss_type == 'smooth_l1':
+                loss = F.smooth_l1_loss(s_aligned, t_detached, beta=1.0)
+            else:
+                raise ValueError(f"Unsupported loss_type: {self.loss_type}")
+            
+            total_loss += loss
+        
+        return (total_loss / len(student_features)) * self.loss_weight
+    
 
 
 class BaseTrainer:
@@ -122,6 +274,21 @@ class BaseTrainer:
             overrides (dict, optional): Configuration overrides.
             _callbacks (list, optional): List of callback functions.
         """
+        if overrides:
+            self.teacher = overrides.get("teacher", None)
+            self.distillation_config_loss = overrides.get('distillation_config_loss', None)
+
+
+            if "teacher" in overrides:
+                overrides.pop("teacher")
+            
+            if 'distillation_config_loss' in overrides:
+                overrides.pop('distillation_config_loss')
+            
+            
+            if self.distillation_config_loss and not isinstance(self.distillation_config_loss, dict):
+                raise ValueError(f"If distillation_config_loss  is initialized, it must be a dict")
+            
         self.hub_session = overrides.pop("session", None)  # HUB
         self.args = get_cfg(cfg, overrides)
         self.check_resume(overrides)
@@ -132,6 +299,10 @@ class BaseTrainer:
         self.metrics = None
         self.plots = {}
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
+
+        
+
+
 
         # Dirs
         self.save_dir = get_save_dir(self.args)
@@ -269,6 +440,17 @@ class BaseTrainer:
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
+
+        if hasattr(self, 'teacher') and self.teacher is not None:
+            self.teacher = self.teacher.to(self.device)
+            self.teacher.eval() 
+            for param in self.teacher.parameters():
+                param.requires_grad = False  
+            LOGGER.info(f"Knowledge Distillation enabled with teacher model")
+
+          
+        
+
         # Compile model
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 
@@ -380,6 +562,35 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+
+
+        distillation_loss_fn = None
+        if hasattr(self, 'teacher') and self.teacher is not None:
+            kd_config = self.distillation_config_loss or {}
+            reduction = kd_config.get('reduction', 'mean')
+            loss_weight = kd_config.get('loss_weight', 1.0)
+            temperature = kd_config.get('temperature', 10.0)
+            detach_target = kd_config.get('detach_target', True)
+            distillation_loss_fn = KnowledgeDistillationKLDivLoss(
+                reduction=reduction,
+                loss_weight=loss_weight,
+                T=temperature,
+                detach_target=detach_target
+            )
+            LOGGER.info(f"KD Loss initialized: T={temperature}, weight={loss_weight}")
+
+          
+            self.feat_distill_loss = FeatureDistillationLoss(
+                student_channels=[64, 128, 256],   
+                teacher_channels=[384, 768, 768],   
+                loss_weight=0.5,                   
+                loss_type='mse'                    
+            ).to(self.device)
+            LOGGER.info(f"Feature distillation enabled: {self.feat_distill_loss}")
+
+
+
+        
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
@@ -402,6 +613,7 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -425,16 +637,34 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
+                    preds = self.model(batch["img"])
                     if self.args.compile:
                         # Decouple inference and loss calculations for improved compile performance
-                        preds = self.model(batch["img"])
                         loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                     else:
                         loss, self.loss_items = self.model(batch)
                     self.loss = loss.sum()
+
+                    if distillation_loss_fn is not None and hasattr(self, 'teacher'):
+                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                        with torch.no_grad():
+                            teacher_preds = self.teacher(batch['img'])
+                        
+                        kd_loss = self._compute_distillation_loss(
+                            student_preds=preds,
+                            teacher_preds=teacher_preds,
+                            distillation_loss_fn=distillation_loss_fn
+                        )
+                       
+                        self.loss = self.loss + kd_loss
+                        
+
+
                     if RANK != -1:
                         self.loss *= self.world_size
                     self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                
+             
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
@@ -535,6 +765,112 @@ class BaseTrainer:
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
+    
+    def _compute_distillation_loss(self, student_preds, teacher_preds, distillation_loss_fn, objectness_threshold = 0.5, topk=200):
+        """
+        Compute KD loss specifically for YOLO end-to-end / dual-head structures.
+        """
+        
+        # print(f"[DEBUG] - {type(student_preds)=}")
+        # print(f"[DEBUG] - {type(teacher_preds)=}")
+
+        # print(f"{student_preds.keys()=}")
+        # print(f"{student_preds['one2many'].keys()=}")
+        # print(f"{student_preds['one2many']['boxes'].shape=}")
+        # print(f"{student_preds['one2many']['scores'].shape=}")
+        # print(f"{len(student_preds['one2many']['feats'])=}")
+        # print(f"{student_preds['one2many']['feats'][0].shape=}")
+        # print(f"{student_preds['one2many']['feats'][1].shape=}")
+        # print(f"{student_preds['one2many']['feats'][2].shape=}")
+
+        # print(f"{student_preds['one2one'].keys()=}")
+        # print(f"{student_preds['one2one']['boxes'].shape=}")
+        # print(f"{student_preds['one2one']['scores'].shape=}")
+        # print(f"{len(student_preds['one2one']['feats'])=}")
+        # print(f"{student_preds['one2one']['feats'][0].shape=}")
+        # print(f"{student_preds['one2one']['feats'][1].shape=}")
+        # print(f"{student_preds['one2one']['feats'][2].shape=}")
+
+
+        # print(f"{len(teacher_preds)=}")
+        # print(f"{teacher_preds[0].shape=}")
+        # print(f"{teacher_preds[1].keys()=}")
+        # print(f"{teacher_preds[1]['one2many'].keys()=}")
+        # print(f"{teacher_preds[1]['one2many']['boxes'].shape=}")
+        # print(f"{teacher_preds[1]['one2many']['scores'].shape=}")
+        # print(f"{len(teacher_preds[1]['one2many']['feats'])=}")
+        # print(f"{teacher_preds[1]['one2many']['feats'][0].shape=}")
+        # print(f"{teacher_preds[1]['one2many']['feats'][1].shape=}")
+        # print(f"{teacher_preds[1]['one2many']['feats'][2].shape=}")
+
+      
+        # print(f"{teacher_preds[1]['one2one'].keys()=}")
+        # print(f"{teacher_preds[1]['one2one']['boxes'].shape=}")
+        # print(f"{teacher_preds[1]['one2one']['scores'].shape=}")
+        # print(f"{len(teacher_preds[1]['one2one']['feats'])=}")
+        # print(f"{teacher_preds[1]['one2one']['feats'][0].shape=}")
+        # print(f"{teacher_preds[1]['one2one']['feats'][1].shape=}")
+        # print(f"{teacher_preds[1]['one2one']['feats'][2].shape=}")
+
+
+        total_kd_loss = torch.tensor(0.0, device=self.device)
+        t_dict = teacher_preds[1]
+        s_dict = student_preds
+        
+        
+        s_o2m, t_o2m = s_dict['one2many'], t_dict['one2many']
+        s_o2o, t_o2o = s_dict['one2one'], t_dict['one2one']
+
+       
+        with torch.no_grad():
+           
+            t_conf = t_o2m['scores'].max(1)[0].sigmoid() 
+            _, topk_indices = torch.topk(t_conf, k=topk, dim=1) 
+
+        def gather_topk(tensor, indices):
+            # tensor shape: [B, C, 8400] -> [B, 8400, C]
+            b, c, a = tensor.shape
+            t = tensor.permute(0, 2, 1) 
+            # gather: [B, topk, C]
+            return torch.stack([t[i][indices[i]] for i in range(b)])
+
+        # --- 2. DENSE LOGIT KD (Filtered by Top-K) ---
+        s_cls_topk = gather_topk(s_o2m['scores'], topk_indices).reshape(-1, s_o2m['scores'].shape[1])
+        t_cls_topk = gather_topk(t_o2m['scores'], topk_indices).reshape(-1, t_o2m['scores'].shape[1])
+        dense_distil_loss = distillation_loss_fn(s_cls_topk, t_cls_topk)
+        total_kd_loss += dense_distil_loss
+
+        # --- 3. SPARSE LOGIT KD (Like-for-Like) ---
+        s_o2o_cls = gather_topk(s_o2o['scores'], topk_indices).reshape(-1, s_o2o['scores'].shape[1])
+        t_o2o_cls = gather_topk(t_o2o['scores'], topk_indices).reshape(-1, t_o2o['scores'].shape[1])
+        sparse_distil_loss = distillation_loss_fn(s_o2o_cls, t_o2o_cls)
+        total_kd_loss += 0.7 * sparse_distil_loss
+
+        # --- 4. FEATURE KD (MGD) ---
+        if hasattr(self, 'mgd_loss_fn'):
+            feat_loss = self.feat_distill_loss(s_o2m['feats'], t_o2m['feats'])
+            total_kd_loss += feat_loss
+
+        # --- 5. BOX REGRESSION (IoU) ---
+        box_mask = t_conf > objectness_threshold
+        if box_mask.any():
+            s_boxes = s_o2m['boxes'].permute(0, 2, 1)[box_mask]
+            t_boxes = t_o2m['boxes'].permute(0, 2, 1)[box_mask]
+            iou = batch_iou(s_boxes, t_boxes)
+            box_loss = (1.0 - iou).mean() * 2.5
+            total_kd_loss += box_loss
+
+        # print(f"{dense_distil_loss=}")
+        # print(f"{sparse_distil_loss=}")
+        # print(f"{feat_loss=}")
+        # print(f"{box_loss=}")
+
+        return total_kd_loss
+
+
+    
+
+
 
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""
