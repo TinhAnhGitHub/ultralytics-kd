@@ -157,61 +157,34 @@ def batch_iou(box1, box2):
 
 
 class FeatureDistillationLoss(nn.Module):
-    """
-    Standard feature-level knowledge distillation.
-    Projects student features to teacher channel dimensions and computes MSE loss.
-    
-    Args:
-        student_channels (List[int]): Channel dimensions of student features [C1, C2, C3]
-        teacher_channels (List[int]): Channel dimensions of teacher features [C1, C2, C3]
-        loss_weight (float): Weight for the distillation loss (default: 1.0)
-        loss_type (str): 'mse' | 'l1' | 'smooth_l1' (default: 'mse')
-    """
-    def __init__(self, student_channels, teacher_channels, loss_weight=1.0, loss_type='mse'):
+    def __init__(self, student_channels, teacher_channels, loss_weight=1.0, tau=1.0):
         super().__init__()
         self.loss_weight = loss_weight
-        self.loss_type = loss_type.lower()
-        
-        self.align_layers = nn.ModuleList()
-        for s_ch, t_ch in zip(student_channels, teacher_channels):
-            if s_ch != t_ch:
-                layer = nn.Sequential(
-                    nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(t_ch)  
-                )
-                self.align_layers.append(layer)
-            else:
-                self.align_layers.append(nn.Identity())
+        self.tau = tau  
+        self.align_layers = nn.ModuleList([
+            nn.Conv2d(s, t, 1) if s != t else nn.Identity() 
+            for s, t in zip(student_channels, teacher_channels)
+        ])
     
     def forward(self, student_features, teacher_features):
-        """
-        Args:
-            student_features: List[Tensor] - [B, C_s, H, W] for each level
-            teacher_features: List[Tensor] - [B, C_t, H, W] for each level (same spatial dims)
-        
-        Returns:
-            Scalar distillation loss
-        """
-        assert len(student_features) == len(teacher_features), \
-            f"Mismatched feature levels: {len(student_features)} vs {len(teacher_features)}"
-        
         total_loss = 0.0
         for i, (s_feat, t_feat) in enumerate(zip(student_features, teacher_features)):
             s_aligned = self.align_layers[i](s_feat)
-            
             t_detached = t_feat.detach()
-            
-            if self.loss_type == 'mse':
-                loss = F.mse_loss(s_aligned, t_detached)
-            elif self.loss_type == 'l1':
-                loss = F.l1_loss(s_aligned, t_detached)
-            elif self.loss_type == 'smooth_l1':
-                loss = F.smooth_l1_loss(s_aligned, t_detached, beta=1.0)
-            else:
-                raise ValueError(f"Unsupported loss_type: {self.loss_type}")
-            
-            total_loss += loss
-        
+
+            # B, C, H, W -> B, C, H*W
+            b, c, h, w = s_aligned.shape
+            s_map = s_aligned.view(b, c, -1) / self.tau
+            t_map = t_detached.view(b, c, -1) / self.tau
+
+       
+            s_prob = F.softmax(s_map, dim=-1)
+            t_prob = F.softmax(t_map, dim=-1)
+
+            # KL Divergence between the heatmaps
+            loss = torch.sum(t_prob * (torch.log(t_prob + 1e-7) - torch.log(s_prob + 1e-7)))
+            total_loss += (loss / (b * c))
+
         return (total_loss / len(student_features)) * self.loss_weight
     
 
@@ -582,9 +555,7 @@ class BaseTrainer:
           
             self.feat_distill_loss = FeatureDistillationLoss(
                 student_channels=[64, 128, 256],   
-                teacher_channels=[384, 768, 768],   
-                loss_weight=0.5,                   
-                loss_type='mse'                    
+                teacher_channels=[384, 768, 768],                 
             ).to(self.device)
             LOGGER.info(f"Feature distillation enabled: {self.feat_distill_loss}")
 
@@ -646,7 +617,20 @@ class BaseTrainer:
                     self.loss = loss.sum()
 
                     if distillation_loss_fn is not None and hasattr(self, 'teacher'):
-                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                        
+                        ni = i + nb * epoch
+                        warmup_epochs = 10 
+                        warmup_steps = warmup_epochs * nb
+                        total_steps = self.epochs * nb
+
+                        if ni < warmup_steps:
+                            distill_weight = 0.1 + (0.9 * (ni / warmup_steps))
+                        else:
+                            decay_steps = total_steps - warmup_steps
+                            step_in_decay = ni - warmup_steps
+                            distill_weight = 0.1 + (0.9 * 0.5 * (1 + math.cos(math.pi * step_in_decay / decay_steps)))
+
+
                         with torch.no_grad():
                             teacher_preds = self.teacher(batch['img'])
                         
@@ -655,8 +639,10 @@ class BaseTrainer:
                             teacher_preds=teacher_preds,
                             distillation_loss_fn=distillation_loss_fn
                         )
+                        kd_loss_weighted = kd_loss * distill_weight
+                 
                        
-                        self.loss = self.loss + kd_loss
+                        self.loss = self.loss + kd_loss_weighted
                         
 
 
@@ -766,7 +752,7 @@ class BaseTrainer:
         unset_deterministic()
         self.run_callbacks("teardown")
     
-    def _compute_distillation_loss(self, student_preds, teacher_preds, distillation_loss_fn, objectness_threshold = 0.5, topk=200):
+    def _compute_distillation_loss(self, student_preds, teacher_preds, distillation_loss_fn, objectness_threshold = 0.3):
         """
         Compute KD loss specifically for YOLO end-to-end / dual-head structures.
         """
@@ -821,54 +807,44 @@ class BaseTrainer:
         s_o2m, t_o2m = s_dict['one2many'], t_dict['one2many']
         s_o2o, t_o2o = s_dict['one2one'], t_dict['one2one']
 
-       
-        with torch.no_grad():
-           
-            t_conf = t_o2m['scores'].max(1)[0].sigmoid() 
-            _, topk_indices = torch.topk(t_conf, k=topk, dim=1) 
-
-        def gather_topk(tensor, indices):
-            # tensor shape: [B, C, 8400] -> [B, 8400, C]
-            b, c, a = tensor.shape
-            t = tensor.permute(0, 2, 1) 
-            # gather: [B, topk, C]
-            return torch.stack([t[i][indices[i]] for i in range(b)])
-
-        # --- 2. DENSE LOGIT KD (Filtered by Top-K) ---
-        s_cls_topk = gather_topk(s_o2m['scores'], topk_indices).reshape(-1, s_o2m['scores'].shape[1])
-        t_cls_topk = gather_topk(t_o2m['scores'], topk_indices).reshape(-1, t_o2m['scores'].shape[1])
-        dense_distil_loss = distillation_loss_fn(s_cls_topk, t_cls_topk)
+      
+        # --- 2. DENSE LOGIT KD ---
+        s_cls = s_o2m['scores'].permute(0, 2, 1).reshape(-1, s_o2m['scores'].shape[1])
+        t_cls = t_o2m['scores'].permute(0, 2, 1).reshape(-1, t_o2m['scores'].shape[1])
+        dense_distil_loss =  distillation_loss_fn(s_cls, t_cls)
         total_kd_loss += dense_distil_loss
 
         # --- 3. SPARSE LOGIT KD (Like-for-Like) ---
-        s_o2o_cls = gather_topk(s_o2o['scores'], topk_indices).reshape(-1, s_o2o['scores'].shape[1])
-        t_o2o_cls = gather_topk(t_o2o['scores'], topk_indices).reshape(-1, t_o2o['scores'].shape[1])
+        s_o2o_cls = s_o2o['scores'].permute(0, 2, 1).reshape(-1, s_o2o['scores'].shape[1])
+        t_o2o_cls = t_o2o['scores'].permute(0, 2, 1).reshape(-1, t_o2o['scores'].shape[1])
         sparse_distil_loss = distillation_loss_fn(s_o2o_cls, t_o2o_cls)
-        total_kd_loss += 0.7 * sparse_distil_loss
+        total_kd_loss += 0.5 * sparse_distil_loss
 
-        # --- 4. FEATURE KD (MGD) ---
-        if hasattr(self, 'mgd_loss_fn'):
-            feat_loss = self.feat_distill_loss(s_o2m['feats'], t_o2m['feats'])
-            total_kd_loss += feat_loss
+     
+    
+        feat_loss = self.feat_distill_loss(s_o2m['feats'], t_o2m['feats'])
+        total_kd_loss += feat_loss * 0.02
 
         # --- 5. BOX REGRESSION (IoU) ---
-        box_mask = t_conf > objectness_threshold
-        if box_mask.any():
-            s_boxes = s_o2m['boxes'].permute(0, 2, 1)[box_mask]
-            t_boxes = t_o2m['boxes'].permute(0, 2, 1)[box_mask]
-            iou = batch_iou(s_boxes, t_boxes)
-            box_loss = (1.0 - iou).mean() * 2.5
-            total_kd_loss += box_loss
 
+        with torch.no_grad():
+            t_conf = t_o2m['scores'].max(1)[0].sigmoid()
+            box_weight = (t_conf > objectness_threshold).float().unsqueeze(-1) 
+        
+        s_boxes = s_o2m['boxes'].permute(0, 2, 1) # [B, 8400, 4]
+        t_boxes = t_o2m['boxes'].permute(0, 2, 1) # [B, 8400, 4]
+        
+        box_kd = (F.smooth_l1_loss(s_boxes, t_boxes, reduction='none') * box_weight).sum() / (box_weight.sum() + 1e-6)
+        total_kd_loss += box_kd * 2.5 
+        
+        # print("\n")
         # print(f"{dense_distil_loss=}")
         # print(f"{sparse_distil_loss=}")
         # print(f"{feat_loss=}")
-        # print(f"{box_loss=}")
+        # print(f"{box_kd=}")
+        # print("\n")
 
         return total_kd_loss
-
-
-    
 
 
 
