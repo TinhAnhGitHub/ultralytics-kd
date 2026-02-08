@@ -7,7 +7,7 @@ Usage:
 """
 
 from __future__ import annotations
-
+from typing import cast
 import gc
 import math
 import os
@@ -104,7 +104,7 @@ class KnowledgeDistillationKLDivLoss(nn.Module):
         
         Args:
             pred (torch.Tensor): Predicted logits from student model.
-                Shape: (N, C) or (N, C, H, W) for segmentation
+                Shape: (N, C) or (N, C, H, W) 
             soft_label (torch.Tensor): Target logits from teacher model.
                 Must have the same shape as pred.
             weight (torch.Tensor, optional): Element-wise weights.
@@ -156,38 +156,648 @@ def batch_iou(box1, box2):
 
 
 
-class FeatureDistillationLoss(nn.Module):
-    def __init__(self, student_channels, teacher_channels, loss_weight=1.0, tau=1.0):
+# class FeatureDistillationLoss(nn.Module):
+#     def __init__(self, student_channels, teacher_channels, loss_weight=1.0, tau=4.0):
+#         super().__init__()
+#         self.loss_weight = loss_weight
+#         self.tau = tau  
+#         self.align_layers = nn.ModuleList([
+#             nn.Sequential(
+#                 nn.Conv2d(s, t, 1, bias=False),
+#                 nn.BatchNorm2d(t), 
+#             ) if s != t else nn.Identity()
+#             for s, t in zip(student_channels, teacher_channels)
+#         ])
+#         self.level_weights = nn.Parameter(torch.ones(len(student_channels)))
+    
+#     def forward(self, student_features, teacher_features):
+#         total_loss = 0.0
+#         for i, (s_feat, t_feat) in enumerate(zip(student_features, teacher_features)):
+#             s_aligned = self.align_layers[i](s_feat)
+#             if s_aligned.shape[2:] != t_feat.shape[2:]:
+#                 s_aligned = F.interpolate(
+#                     s_aligned, size=t_feat.shape[2:], mode='bilinear', align_corners=False
+#                 )
+
+#             s_norm = F.normalize(s_aligned, p=2, dim=1)
+#             t_norm = F.normalize(t_feat.detach(), p=2, dim=1)
+#             #loss = F.mse_loss(s_norm, t_norm, reduction='mean')
+#             loss = 1.0 - F.cosine_similarity(s_norm, t_norm, dim=1).mean()
+
+#             weighted_loss = loss * self.level_weights[i]
+#             total_loss += weighted_loss
+
+#         avg_loss = total_loss / self.level_weights.sum()
+#         return avg_loss * self.loss_weight
+
+
+# class MaskedGenerativeDistillation(nn.Module):
+#     def __init__(
+#         self,
+#         student_channels: list[int],  # [num_classes+4, num_classes+4, num_classes+4] for 3 scales
+#         teacher_channels: list[int],  # 
+#         alpha: float = 0.67,
+#         loss_weight: float = 2e-6
+#     ):
+#         super().__init__()
+#         assert len(student_channels) == len(teacher_channels)
+#         self.alpha = alpha
+#         self.loss_weight = loss_weight
+#         self.num_levels = len(student_channels)
+        
+#         self.align_layers = nn.ModuleList([
+#             nn.Conv2d(s, t, 1, bias=False) if s != t else nn.Identity()
+#             for s, t in zip(student_channels, teacher_channels)
+#         ])
+        
+#         self.generators = nn.ModuleList([
+#             nn.Sequential(
+#                 nn.Conv2d(t, t, 3, padding=1, bias=True),
+#                 nn.ReLU(inplace=True),
+#                 nn.Conv2d(t, t, 3, padding=1, bias=True)
+#             ) for t in teacher_channels
+#         ])
+        
+        
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+    
+#     def generate_mask(self, shape, device):
+#         B, C, H, W = shape
+#         rand = torch.rand(B, 1, H, W, device=device)
+#         mask = (rand >= self.alpha).float()  # Keep (1-alpha) proportion
+#         return mask
+    
+#     def forward(self, student_features, teacher_features):
+#         """
+#         Args:
+#             student_features: List of tensors from student DETECTION HEADS [S^1, S^2, S^3]
+#                              Each: (B, C_det, H, W) where C_det = num_classes + 4
+#             teacher_features: List of tensors from teacher DETECTION HEADS [T^1, T^2, T^3]
+#         """
+#         total_loss = 0.0
+        
+#         for level_idx, (s_feat, t_feat) in enumerate(zip(student_features, teacher_features)):
+#             if s_feat.shape[2:] != t_feat.shape[2:]:
+#                 s_feat = F.interpolate(s_feat, size=t_feat.shape[2:], 
+#                                       mode='bilinear', align_corners=False)
+            
+#             s_aligned = self.align_layers[level_idx](s_feat)
+            
+#             mask = self.generate_mask(s_aligned.shape, s_aligned.device)
+#             s_masked = s_aligned * mask  
+            
+#             s_generated = self.generators[level_idx](s_masked)
+            
+#             level_loss = F.mse_loss(s_generated, t_feat.detachmake_student_hook(), reduction='sum')
+#             total_loss += level_loss
+        
+#         avg_loss = total_loss / self.num_levels
+#         return avg_loss * self.loss_weight
+
+class CWDLoss(nn.Module):
+    """PyTorch version of `Channel-wise Distillation for Semantic Segmentation.
+    <https://arxiv.org/abs/2011.13256>`_.
+    """
+
+    def __init__(self, channels_s, channels_t, tau=4.0):
+        super().__init__()
+        self.tau = tau
+
+    def forward(self, y_s, y_t):
+        """Forward computation.
+        Args:
+            y_s (list): The student model prediction with
+                shape (N, C, H, W) in list.
+            y_t (list): The teacher model prediction with
+                shape (N, C, H, W) in list.
+        Return:
+            torch.Tensor: The calculated loss value of all stages.
+        """
+        assert len(y_s) == len(y_t)
+        losses = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            assert s.shape == t.shape
+            N, C, H, W = s.shape
+
+            softmax_pred_T = F.softmax(t.view(-1, W * H) / self.tau, dim=1)
+            logsoftmax_s = F.log_softmax(s.view(-1, W * H) / self.tau, dim=1)
+
+            cost = F.kl_div(logsoftmax_s, softmax_pred_T.detach(), reduction='sum') * (self.tau ** 2)
+
+            losses.append(cost / (C * N))
+        loss = sum(losses)
+        return loss
+
+class MGDLoss(nn.Module):
+    def __init__(self,
+                 student_channels,
+                 teacher_channels,
+                 alpha_mgd=0.00002,
+                 lambda_mgd=0.65,
+                 ):
+        super(MGDLoss, self).__init__()
+        self.alpha_mgd = alpha_mgd
+        self.lambda_mgd = lambda_mgd
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.generation = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(channel, channel, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channel, channel, kernel_size=3, padding=1)
+            ).to(device) for channel in teacher_channels
+        ])
+
+    def forward(self, y_s, y_t, layer=None):
+        """Forward computation.
+        Args:
+            y_s (list): The student model prediction with
+                shape (N, C, H, W) in list.
+            y_t (list): The teacher model prediction with
+                shape (N, C, H, W) in list.
+        Return:
+            torch.Tensor: The calculated loss value of all stages.
+        """
+        losses = []
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            # print(s.shape)
+            # print(t.shape)
+            # assert s.shape == t.shape
+            if layer == "outlayer":
+                idx = -1
+            losses.append(self.get_dis_loss(s, t, idx) * self.alpha_mgd)
+        loss = sum(losses)
+        return loss
+
+    def get_dis_loss(self, preds_S, preds_T, idx):
+        loss_mse = nn.MSELoss(reduction='sum')
+        N, C, H, W = preds_T.shape
+
+        device = preds_S.device
+        mat = torch.rand((N, 1, H, W)).to(device)
+        mat = torch.where(mat > 1 - self.lambda_mgd, 0, 1).to(device)
+
+        masked_fea = torch.mul(preds_S, mat)
+        new_fea = self.generation[idx](masked_fea)
+
+        dis_loss = loss_mse(new_fea, preds_T) / N
+        return dis_loss
+
+class ChannelWiseMLP(nn.Module):
+    """
+    2-layer MLP with ReLU activation for channel-wise transformation.
+    Uses 1x1 convolutions as described in the paper.
+    """
+    def __init__(self, in_channels, hidden_channels=None):
+        super().__init__()
+        if hidden_channels is None:
+            hidden_channels = in_channels 
+        
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, in_channels, kernel_size=1, bias=True)
+        )
+        
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class ChannelWiseDistillationLoss(nn.Module):
+    """
+    Channel-wise Feature Distillation from ICCVW 2023 paper.
+    
+    "A Simple and Generic Framework for Feature Distillation via Channel-Wise Transformation"
+    
+    Key differences from CWD/MGD:
+    - Uses simple 2-layer MLP (1x1 conv + ReLU + 1x1 conv) only on student features
+    - Uses L2 distance instead of KL divergence or generative approach
+    - No spatial-wise transformation or attention masks
+    - Teacher features are used directly (identity transform)
+    """
+    def __init__(self, channels_s, channels_t, loss_weight=1.0):
         super().__init__()
         self.loss_weight = loss_weight
-        self.tau = tau  
-        self.align_layers = nn.ModuleList([
-            nn.Conv2d(s, t, 1) if s != t else nn.Identity() 
-            for s, t in zip(student_channels, teacher_channels)
-        ])
+        self.align_modules = nn.ModuleList()
+        self.mlp_modules = nn.ModuleList()
+        
+        for s_ch, t_ch in zip(channels_s, channels_t):
+            if s_ch != t_ch:
+                align = nn.Conv2d(s_ch, t_ch, kernel_size=1, bias=False)
+                nn.init.kaiming_normal_(align.weight, mode='fan_out', nonlinearity='linear')
+            else:
+                align = nn.Identity()
+            
+            self.align_modules.append(align)
+            self.mlp_modules.append(ChannelWiseMLP(t_ch))
     
-    def forward(self, student_features, teacher_features):
+    def forward(self, y_s, y_t):
+        """
+        Args:
+            y_s: List of student features [N, C_s, H, W]
+            y_t: List of teacher features [N, C_t, H, W]
+        Returns:
+            L2 distillation loss (scalar)
+        """
+        assert len(y_s) == len(y_t), f"Number of features mismatch: {len(y_s)} vs {len(y_t)}"
+        
         total_loss = 0.0
-        for i, (s_feat, t_feat) in enumerate(zip(student_features, teacher_features)):
-            s_aligned = self.align_layers[i](s_feat)
-            t_detached = t_feat.detach()
+        n = y_s[0].shape[0]  
+        
+        
+        for idx, (s_feat, t_feat) in enumerate(zip(y_s, y_t)):
+            module_device = s_feat.device
+            module_dtype  = s_feat.dtype
 
-            # B, C, H, W -> B, C, H*W
-            b, c, h, w = s_aligned.shape
-            s_map = s_aligned.view(b, c, -1) / self.tau
-            t_map = t_detached.view(b, c, -1) / self.tau
+            self.align_modules[idx] = self.align_modules[idx].to(
+                device=module_device,
+                dtype=module_dtype
+            )
+
+            self.mlp_modules[idx] = self.mlp_modules[idx].to(
+                device=module_device,
+                dtype=module_dtype
+            )
+
+            s_aligned = self.align_modules[idx](s_feat)
+            if s_aligned.shape[2:] != t_feat.shape[2:]:
+                s_aligned = F.interpolate(
+                    s_aligned, size=t_feat.shape[2:], 
+                    mode='bilinear', align_corners=False
+                )
+            
+            s_transformed = self.mlp_modules[idx](s_aligned)
+            
+            
+            layer_loss = F.mse_loss(s_transformed, t_feat.detach(), reduction='mean')            
+            total_loss += layer_loss
+        
+
+        avg_loss = total_loss / len(y_s)
+        return self.loss_weight * avg_loss
+    
+
+class FeatureLoss(nn.Module):
+    def __init__(self, channels_s, channels_t, distiller='mgd', loss_weight=1.0):
+        super(FeatureLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.distiller = distiller
+        
+        # Move all modules to same precision
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Convert to ModuleList and ensure consistent dtype
+        self.align_module = nn.ModuleList()
+        self.norm = nn.ModuleList()
+        self.norm1 = nn.ModuleList()
+        
+        # Create alignment modules
+        for s_chan, t_chan in zip(channels_s, channels_t):
+            align = nn.Sequential(
+                nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(t_chan, affine=False)
+            ).to(device)
+            self.align_module.append(align)
+            
+        # Create normalization layers
+        for t_chan in channels_t:
+            self.norm.append(nn.BatchNorm2d(t_chan, affine=False).to(device))
+            
+        for s_chan in channels_s:
+            self.norm1.append(nn.BatchNorm2d(s_chan, affine=False).to(device))
+
+        # if distiller == 'mgd':
+        #     self.feature_loss = MGDLoss(channels_s, channels_t)
+        # elif distiller == 'cwd':
+        #     self.feature_loss = CWDLoss(channels_s, channels_t)
+        # elif distiller == 'channel_wise' or distiller == 'cw':  # NEW
+        #     self.feature_loss = ChannelWiseDistillationLoss(channels_s, channels_t, loss_weight)
+        # else:
+        #     raise NotImplementedError
+        self.feature_loss = ChannelWiseDistillationLoss(channels_s, channels_t, loss_weight)
+
+    def forward(self, y_s, y_t):
+        return self.feature_loss(y_s, y_t)
+    
+        # if len(y_s) != len(y_t):
+        #     y_t = y_t[len(y_t) // 2:]
+
+        # tea_feats = []
+        # stu_feats = []
+
+        # for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            
+        #     s = s.type(next(self.align_module[idx].parameters()).dtype)
+        #     t = t.type(next(self.align_module[idx].parameters()).dtype)
+
+        #     if self.distiller == "cwd":
+        #         s = self.align_module[idx](s)
+        #         stu_feats.append(s)
+        #         tea_feats.append(t.detach())
+        #     else:
+        #         t = self.norm[idx](t)
+        #         stu_feats.append(s)
+        #         tea_feats.append(t.detach())
+
+        # loss = self.feature_loss(stu_feats, tea_feats)
+        # return self.loss_weight * loss
+
+class UnifiedDistillationLoss(nn.Module):
+    """
+    Unified distillation loss combining multiple distillation strategies:
+    1. Feature distillation (CWD/MGD) - intermediate layer features
+    2. Dense logit distillation (one2many head)
+    3. Sparse logit distillation (one2one head)
+    4. Box regression distillation
+    
+    All hyperparameters are configurable via distillation_config dict.
+    """
+    def __init__(self, models, modelt, distillation_config=None):
+        super().__init__()
+        self.distillation_config = distillation_config or {}
+        self.models = models
+        self.modelt = modelt
+
+        self._parse_config()
+        self._setup_feature_distillation()
+        self._setup_logit_distillation()
+
+        self.teacher_outputs = []
+        self.student_outputs = []
+        self.remove_handle = []
+
+        self.student_preds = None
+        self.teacher_preds = None
+    
+    def _parse_config(self):
+        cfg = self.distillation_config
+
+        self.feature_distiller = cfg.get('feature_distiller', 'cwd')
+        self.feature_loss_weight = cfg.get('feature_loss_weight', 1.0)
+        self.feature_layers = cfg.get('feature_layers', ["6", "8", "13", "16", "19", "22"])
+
+        self.logit_temperature = cfg.get('logit_temperature', 4.0)
+        self.dense_logit_weight = cfg.get('dense_logit_weight', 1.0)
+        self.sparse_logit_weight = cfg.get('sparse_logit_weight', 0.5)
+        self.logit_detach_target = cfg.get('logit_detach_target', True)
+        self.logit_reduction = cfg.get('logit_reduction', 'mean')
+
+        self.box_loss_weight = cfg.get('box_loss_weight', 2.5)
+        self.box_objectness_threshold = cfg.get('box_objectness_threshold', 0.3)
+
+        self.dynamic_weight_start = cfg.get('dynamic_weight_start', 1.0)
+        self.dynamic_weight_end = cfg.get('dynamic_weight_end', 0.1)
+
+    
+    def _setup_feature_distillation(self):
+    
+        self.channels_s = []
+        self.channels_t = []
+        self.teacher_module_pairs = []
+        self.student_module_pairs = []
+
+        self._find_feature_layers()
+        if self.channels_s and self.channels_t:
+            self.feature_loss_fn = FeatureLoss(
+                channels_s=self.channels_s,
+                channels_t=self.channels_t,
+                distiller=self.feature_distiller,
+                loss_weight=self.feature_loss_weight
+            )
+            
+        else:
+            self.feature_loss_fn = None
+            LOGGER.warning("No matching layers found for feature distillation")
+    
+    def _find_feature_layers(self):
+        
+        def get_layer_output_channels(model, layer_idx):# -> tuple[None, None] | tuple[Any, Any]:
+            path = f"model.{layer_idx}"
+            module = dict(model.named_modules()).get(path)
+            if module is None:
+                return None, None
+                
+            # Infer output channels from module type
+            if hasattr(module, 'cv2'):  # C3k2, C2f, etc.
+                return module, module.cv2.conv.out_channels
+            elif hasattr(module, 'conv'):  # Conv, SPPF
+                return module, module.conv.out_channels
+            elif hasattr(module, 'out_channels'):  
+                return module, module.out_channels
+            else:
+                next_path = f"model.{layer_idx + 1}"
+                next_module = dict(model.named_modules()).get(next_path)
+                if hasattr(next_module, 'in_channels'):
+                    return module, next_module.in_channels
+            return None, None
+        
+        for idx in self.feature_layers:
+            module, channels = get_layer_output_channels(self.modelt, idx)
+            if module is not None:
+                self.channels_t.append(channels)
+                self.teacher_module_pairs.append(module)
+                LOGGER.info(f"Teacher layer {idx}: {module.__class__.__name__}, channels={channels}")
+        
+        for idx in self.feature_layers:
+            module, channels = get_layer_output_channels(self.models, idx)
+            if module is not None:
+                self.channels_s.append(channels)
+                self.student_module_pairs.append(module)
+                LOGGER.info(f"Student layer {idx}: {module.__class__.__name__}, channels={channels}")
+
+        
+        nl = min(len(self.channels_s), len(self.channels_t))
+        if nl > 0:
+            self.channels_s = self.channels_s[-nl:]
+            self.channels_t = self.channels_t[-nl:]
+            self.teacher_module_pairs = self.teacher_module_pairs[-nl:]
+            self.student_module_pairs = self.student_module_pairs[-nl:]
+            
+            LOGGER.info(f"Feature distillation: matched {nl} layer pairs using {self.feature_distiller.upper()}")
+            for i, (t_ch, s_ch) in enumerate(zip(self.channels_t, self.channels_s)):
+                LOGGER.info(f"  Layer {i}: Teacher {t_ch}ch → Student {s_ch}ch")
+        
+    def _setup_logit_distillation(self):
+        """Initialize logit distillation loss functions."""
+        self.dense_kd_loss = KnowledgeDistillationKLDivLoss(
+            reduction=self.logit_reduction,
+            loss_weight=self.dense_logit_weight,
+            T=self.logit_temperature,
+            detach_target=self.logit_detach_target
+        )
+        
+        self.sparse_kd_loss = KnowledgeDistillationKLDivLoss(
+            reduction=self.logit_reduction,
+            loss_weight=self.sparse_logit_weight,
+            T=self.logit_temperature,
+            detach_target=self.logit_detach_target
+        )  
+
+    def register_hook(self):
+        # Remove the existing hook if they exist
+        self.remove_handle_()
+        
+        self.teacher_outputs = []
+        self.student_outputs = []
+
+        def make_student_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    out = output.clone()  # Clone to ensure we don't modify the original
+                    l.append(out)
+                else:
+                    l.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        def make_teacher_hook(l):
+            def forward_hook(m, input, output):
+                if isinstance(output, torch.Tensor):
+                    l.append(output.detach().clone())  # Detach and clone teacher outputs
+                else:
+                    l.append([o.detach().clone() if isinstance(o, torch.Tensor) else o for o in output])
+            return forward_hook
+
+        for ml, ori in zip(self.teacher_module_pairs, self.student_module_pairs):
+            self.remove_handle.append(ml.register_forward_hook(make_teacher_hook(self.teacher_outputs)))
+            self.remove_handle.append(ori.register_forward_hook(make_student_hook(self.student_outputs)))
+        
+    def remove_handle_(self):
+        for rm in self.remove_handle:
+            rm.remove()
+        self.remove_handle.clear()
+
+
+    def compute_feature_loss(self):
+        """Compute feature distillation loss from captured intermediate features."""
+        if not self.teacher_outputs or not self.student_outputs:
+            return torch.tensor(0.0)
+            
+        if len(self.teacher_outputs) != len(self.student_outputs):
+            LOGGER.warning(f"Mismatched feature outputs: Teacher={len(self.teacher_outputs)}, Student={len(self.student_outputs)}")
+            return torch.tensor(0.0)
+            
+        loss = self.feature_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs) #type:ignore
+        
+
+        return loss 
+    
+    def compute_logit_loss(self, student_preds, teacher_preds):
+        """
+        Compute logit distillation losses (dense and sparse).
+        
+        Args:
+            student_preds: Dict with 'one2many' and 'one2one' keys
+            teacher_preds: Dict with 'one2many' and 'one2one' keys
+        """
+        total_loss = torch.tensor(0.0, device=next(self.models.parameters()).device)
+        
+        s_o2m = student_preds['one2many']
+        t_o2m = teacher_preds['one2many']
+        s_o2o = student_preds['one2one']
+        t_o2o = teacher_preds['one2one']
+        s_cls = s_o2m['scores'].permute(0, 2, 1).reshape(-1, s_o2m['scores'].shape[1])
+        t_cls = t_o2m['scores'].permute(0, 2, 1).reshape(-1, t_o2m['scores'].shape[1])
+        dense_loss = self.dense_kd_loss(s_cls, t_cls)
+        total_loss += dense_loss
+
+        s_o2o_cls = s_o2o['scores'].permute(0, 2, 1).reshape(-1, s_o2o['scores'].shape[1])
+        t_o2o_cls = t_o2o['scores'].permute(0, 2, 1).reshape(-1, t_o2o['scores'].shape[1])
+        sparse_loss = self.sparse_kd_loss(s_o2o_cls, t_o2o_cls)
+        total_loss += sparse_loss
+        return total_loss
+    
+
+    def compute_box_loss(self, student_preds, teacher_preds):
+        """
+        Compute box regression distillation loss.
+        
+        Uses teacher confidence to weight the loss (focus on high-confidence predictions).
+        """
+        s_o2m = student_preds['one2many']
+        t_o2m = teacher_preds['one2many']
 
        
-            s_prob = F.softmax(s_map, dim=-1)
-            t_prob = F.softmax(t_map, dim=-1)
+        
+        with torch.no_grad():
+            t_conf = t_o2m['scores'].max(1)[0].sigmoid()
+       
+            box_weight = (t_conf > self.box_objectness_threshold).float().unsqueeze(-1)
+        
+        s_boxes = s_o2m['boxes'].permute(0, 2, 1)  # [B, 8400, 4]
+        t_boxes = t_o2m['boxes'].permute(0, 2, 1)  # [B, 8400, 4]
+        
+        box_loss = (F.smooth_l1_loss(s_boxes, t_boxes, reduction='none') * box_weight).sum() / (box_weight.sum() + 1e-6)
 
-            # KL Divergence between the heatmaps
-            loss = torch.sum(t_prob * (torch.log(t_prob + 1e-7) - torch.log(s_prob + 1e-7)))
-            total_loss += (loss / (b * c))
+        weighted_loss = box_loss * self.box_loss_weight
+        
+        return weighted_loss
+    
+    def set_predictions(self, student_preds, teacher_preds):
+        self.student_preds = student_preds
+        self.teacher_preds = teacher_preds
 
-        return (total_loss / len(student_features)) * self.loss_weight
+    def get_loss(self):
+        print()
+        if not self.teacher_outputs or not self.student_outputs:
+            self.teacher_outputs.clear()
+            self.student_outputs.clear()
+            self.student_preds = None
+            self.teacher_preds = None
+            return torch.tensor(0.0, requires_grad=True)
+        
+        if len(self.teacher_outputs) != len(self.student_outputs):
+            print(f"Warning: Mismatched outputs - Teacher: {len(self.teacher_outputs)}, Student: {len(self.student_outputs)}")
+            self.teacher_outputs.clear()
+            self.student_outputs.clear()
+            self.student_preds = None
+            self.teacher_preds = None
+            return torch.tensor(0.0, requires_grad=True)
+        
+
+
+        device = next(self.models.parameters()).device
+        total_loss = torch.tensor(0.0, device=device)
+        
+        
+        # if self.feature_loss_fn is not None:
+        #     feat_loss = self.compute_feature_loss()
+        #     print(f"{feat_loss=}")
+        #     if feat_loss.item() > 0:
+        #         total_loss += feat_loss
+        
+        
+        self.teacher_outputs.clear()
+        self.student_outputs.clear()
+
+        logit_loss = self.compute_logit_loss(self.student_preds, self.teacher_preds)
+        print(f"{logit_loss=}")
+        total_loss += logit_loss
     
 
+        box_loss = self.compute_box_loss(self.student_preds, self.teacher_preds)
+        total_loss += box_loss
+        print(f"{box_loss=}")
+
+        self.student_preds = None
+        self.teacher_preds = None
+
+
+       
+
+        return total_loss
+    
+    
 
 class BaseTrainer:
     """A base class for creating trainers.
@@ -272,8 +882,6 @@ class BaseTrainer:
         self.metrics = None
         self.plots = {}
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
-
-        
 
 
 
@@ -413,13 +1021,22 @@ class BaseTrainer:
         self.model = self.model.to(self.device)
         self.set_model_attributes()
 
+        
+
 
         if hasattr(self, 'teacher') and self.teacher is not None:
             self.teacher = self.teacher.to(self.device)
-            self.teacher.eval() 
+            self.teacher.eval()     
             for param in self.teacher.parameters():
                 param.requires_grad = False  
             LOGGER.info(f"Knowledge Distillation enabled with teacher model")
+
+        #     self.feat_distill_loss = MGDDistillationLoss(
+        #         student_channels=[64, 128, 256],   
+        #         teacher_channels=[384, 768, 768],                 
+        #     ).to(self.device)
+        #     self.model.feat_distill_loss = self.feat_distill_loss
+        #     LOGGER.info(f"MGDDistillationLoss enabled: {self.feat_distill_loss}")
 
           
         
@@ -506,7 +1123,14 @@ class BaseTrainer:
             decay=weight_decay,
             iterations=iterations,
         )
-        # Scheduler
+
+        for group_idx, param_group in enumerate(self.optimizer.param_groups):
+            print(f"Group {group_idx}:")
+            for k, v in param_group.items():
+                if k != 'params':
+                    print(f"  {k}: {v}")
+
+        
         self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
         self.resume_training(ckpt)
@@ -537,31 +1161,32 @@ class BaseTrainer:
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
 
 
-        distillation_loss_fn = None
-        if hasattr(self, 'teacher') and self.teacher is not None:
-            kd_config = self.distillation_config_loss or {}
-            reduction = kd_config.get('reduction', 'mean')
-            loss_weight = kd_config.get('loss_weight', 1.0)
-            temperature = kd_config.get('temperature', 10.0)
-            detach_target = kd_config.get('detach_target', True)
-            distillation_loss_fn = KnowledgeDistillationKLDivLoss(
-                reduction=reduction,
-                loss_weight=loss_weight,
-                T=temperature,
-                detach_target=detach_target
+        # distillation_loss_fn = None
+        # if hasattr(self, 'teacher') and self.teacher is not None:
+        #     kd_config = self.distillation_config_loss or {}
+        #     reduction = kd_config.get('reduction', 'mean')
+        #     loss_weight = kd_config.get('loss_weight', 1.0)
+        #     temperature = kd_config.get('temperature', 10.0)
+        #     detach_target = kd_config.get('detach_target', True)
+        #     distillation_loss_fn = KnowledgeDistillationKLDivLoss(
+        #         reduction=reduction,
+        #         loss_weight=loss_weight,
+        #         T=temperature,
+        #         detach_target=detach_target
+        #     )
+        #     LOGGER.info(f"KD Loss initialized: T={temperature}, weight={loss_weight}")
+
+        if self.teacher is not None:
+            distillation_cfg = getattr(self, 'distillation_config_loss', None) or {}
+            self.distillation_loss = UnifiedDistillationLoss(
+                models=self.model,
+                modelt=self.teacher,
+                distillation_config=distillation_cfg
             )
-            LOGGER.info(f"KD Loss initialized: T={temperature}, weight={loss_weight}")
-
-          
-            self.feat_distill_loss = FeatureDistillationLoss(
-                student_channels=[64, 128, 256],   
-                teacher_channels=[384, 768, 768],                 
-            ).to(self.device)
-            LOGGER.info(f"Feature distillation enabled: {self.feat_distill_loss}")
-
-
-
-        
+            LOGGER.info(f"Unified distillation enabled with config: {distillation_cfg}")
+        else:
+            self.distillation_loss = None
+    
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
@@ -585,6 +1210,9 @@ class BaseTrainer:
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
 
+            if self.teacher is not None and self.distillation_loss is not None:
+                self.distillation_loss.register_hook() 
+
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -605,45 +1233,34 @@ class BaseTrainer:
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
-                # Forward
+                
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    preds = self.model(batch["img"])
-                    if self.args.compile:
-                        # Decouple inference and loss calculations for improved compile performance
-                        loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
-                    else:
-                        loss, self.loss_items = self.model(batch)
+                    student_preds = self.model(batch["img"])
+                    loss, self.loss_items = unwrap_model(self.model).loss(batch, student_preds)
                     self.loss = loss.sum()
+                    
 
-                    if distillation_loss_fn is not None and hasattr(self, 'teacher'):
-                        
-                        ni = i + nb * epoch
-                        warmup_epochs = 10 
-                        warmup_steps = warmup_epochs * nb
-                        total_steps = self.epochs * nb
-
-                        if ni < warmup_steps:
-                            distill_weight = 0.1 + (0.9 * (ni / warmup_steps))
-                        else:
-                            decay_steps = total_steps - warmup_steps
-                            step_in_decay = ni - warmup_steps
-                            distill_weight = 0.1 + (0.9 * 0.5 * (1 + math.cos(math.pi * step_in_decay / decay_steps)))
-
-
+                    if self.teacher is not None:
+                        progress = (epoch * nb + i) / (self.epochs * nb)
+                        distill_weight = 0.5 * (1 + math.cos(progress * math.pi)) 
                         with torch.no_grad():
-                            teacher_preds = self.teacher(batch['img'])
-                        
-                        kd_loss = self._compute_distillation_loss(
-                            student_preds=preds,
-                            teacher_preds=teacher_preds,
-                            distillation_loss_fn=distillation_loss_fn
-                        )
-                        kd_loss_weighted = kd_loss * distill_weight
-                 
-                       
-                        self.loss = self.loss + kd_loss_weighted
-                        
+                            with autocast(self.amp): 
+                                teacher_imgs = batch['img']
+                                teacher_imgs = teacher_imgs.to(self.device)  
+                                teacher_preds = self.teacher(teacher_imgs)
+                                            
+                        self.distillation_loss.set_predictions(student_preds, teacher_preds[1]) #type:ignore
+                            
+                        d_loss = cast(UnifiedDistillationLoss, self.distillation_loss).get_loss() 
+                        d_loss_weighted = d_loss * distill_weight
+                        self.loss = self.loss + d_loss_weighted 
+                    
+                    if self.teacher is not None:
+                        print(f"Task loss: {self.loss.item():.4f}, KD loss: {d_loss.item():.4f}")
+                        print(f"Teacher max conf: {teacher_preds[1]['one2many']['scores'].sigmoid().max():.3f}")
+                        print(f"Student max conf: {student_preds['one2many']['scores'].sigmoid().max():.3f}")
+                                            
 
 
                     if RANK != -1:
@@ -654,6 +1271,8 @@ class BaseTrainer:
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
+
+                    
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()
                     last_opt_step = ni
@@ -689,6 +1308,9 @@ class BaseTrainer:
 
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
+            
+            if self.teacher is not None:
+                self.distillation_loss.remove_handle_()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
@@ -750,6 +1372,9 @@ class BaseTrainer:
             self.run_callbacks("on_train_end")
         self._clear_memory()
         unset_deterministic()
+
+        if self.teacher is not None:
+            self.distillation_loss.remove_handle_()
         self.run_callbacks("teardown")
     
     def _compute_distillation_loss(self, student_preds, teacher_preds, distillation_loss_fn, objectness_threshold = 0.3):
@@ -779,7 +1404,6 @@ class BaseTrainer:
 
 
         # print(f"{len(teacher_preds)=}")
-        # print(f"{teacher_preds[0].shape=}")
         # print(f"{teacher_preds[1].keys()=}")
         # print(f"{teacher_preds[1]['one2many'].keys()=}")
         # print(f"{teacher_preds[1]['one2many']['boxes'].shape=}")
@@ -823,7 +1447,7 @@ class BaseTrainer:
      
     
         feat_loss = self.feat_distill_loss(s_o2m['feats'], t_o2m['feats'])
-        total_kd_loss += feat_loss * 0.02
+        total_kd_loss += feat_loss * 1.0
 
         # --- 5. BOX REGRESSION (IoU) ---
 
@@ -837,12 +1461,12 @@ class BaseTrainer:
         box_kd = (F.smooth_l1_loss(s_boxes, t_boxes, reduction='none') * box_weight).sum() / (box_weight.sum() + 1e-6)
         total_kd_loss += box_kd * 2.5 
         
-        # print("\n")
-        # print(f"{dense_distil_loss=}")
-        # print(f"{sparse_distil_loss=}")
-        # print(f"{feat_loss=}")
-        # print(f"{box_kd=}")
-        # print("\n")
+        print("\n")
+        print(f"{dense_distil_loss=}")
+        print(f"{sparse_distil_loss=}")
+        print(f"{feat_loss=}")
+        print(f"{box_kd=}")
+        print("\n")
 
         return total_kd_loss
 
@@ -1264,9 +1888,14 @@ class BaseTrainer:
             self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam
 
         use_muon = name == "MuSGD"
+    
+        
         for module_name, module in unwrap_model(model).named_modules():
             for param_name, param in module.named_parameters(recurse=False):
-                fullname = f"{module_name}.{param_name}" if module_name else param_name
+                
+                fullname = f"kd.{module_name}.{param_name}" if module_name else f"kd.{param_name}"
+
+
                 if param.ndim >= 2 and use_muon:
                     g[3][fullname] = param  # muon params
                 elif "bias" in fullname:  # bias (no decay)
